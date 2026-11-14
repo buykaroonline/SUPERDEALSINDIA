@@ -1,0 +1,54 @@
+name: Install project from ZIP
+
+# When a project ZIP is uploaded to the repository, this unpacks it into normal
+# files, removes the ZIP, and then starts the website build.
+on:
+  push:
+    paths:
+      - '**.zip'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: install
+  cancel-in-progress: false
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack the ZIP into the repository
+        run: |
+          set -e
+          zip_file=$(ls -t *.zip | head -n 1)
+          echo "Unpacking $zip_file"
+          mkdir _unpacked
+          unzip -q "$zip_file" -d _unpacked
+          marker=$(find _unpacked -path '*/site_builder/cli.py' | head -n 1)
+          if [ -z "$marker" ]; then
+            echo "::error::This ZIP does not contain the website project (site_builder/cli.py not found)."
+            exit 1
+          fi
+          project=$(dirname "$(dirname "$marker")")
+          rsync -a --exclude '.github' --exclude '.git' "$project"/ ./
+          rm -rf _unpacked
+          git rm -q -f --ignore-unmatch -- *.zip
+          rm -f -- *.zip
+
+      - name: Save the files
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -q -m 'Install website project from uploaded ZIP' || echo 'Nothing to change'
+          git push
+
+      - name: Start the website build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run deploy.yml --ref "${{ github.ref_name }}"
