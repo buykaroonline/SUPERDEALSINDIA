@@ -1,0 +1,100 @@
+name: Build and deploy website
+
+on:
+  workflow_dispatch:          # run by hand from the Actions tab
+  push:
+    branches: [main]          # any change to the project republishes the site
+    paths-ignore:
+      - '**.zip'              # an uploaded ZIP is unpacked by install.yml, which then starts this build
+  schedule:
+    - cron: '*/15 * * * *'    # every 15 minutes, so new Telegram posts appear quickly
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      AMAZON_CREATORS_CREDENTIAL_ID: ${{ secrets.AMAZON_CREATORS_CREDENTIAL_ID }}
+      AMAZON_CREATORS_CREDENTIAL_SECRET: ${{ secrets.AMAZON_CREATORS_CREDENTIAL_SECRET }}
+    steps:
+      - name: Check out the project
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check configuration file
+        run: |
+          if [ ! -f config.toml ]; then
+            echo "::error::config.toml is missing. Copy config.example.toml to config.toml and commit it (it holds no secrets)."
+            exit 1
+          fi
+
+      - name: Run tests (manual runs only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          python -m pip install --quiet -r requirements.txt
+          python -m pytest
+
+      - name: Restore saved deal data from the previous run
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/telegram_cache.json
+            data/amazon_cache.json
+          key: deal-data-${{ github.run_id }}
+          restore-keys: deal-data-
+
+      - name: Read new Telegram posts
+        id: telegram
+        continue-on-error: true
+        run: python -m site_builder telegram --config config.toml
+
+      - name: Fetch Amazon deals (at most once every 3 hours)
+        id: fetch
+        if: env.AMAZON_CREATORS_CREDENTIAL_ID != ''
+        continue-on-error: true
+        run: python -m site_builder fetch --config config.toml --if-older-than 3
+
+      - name: Build website
+        run: python -m site_builder build --config config.toml
+
+      - name: Save deal data for the next run
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/telegram_cache.json
+            data/amazon_cache.json
+          key: deal-data-${{ github.run_id }}
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Report refresh failures
+        if: steps.telegram.outcome == 'failure' || steps.fetch.outcome == 'failure'
+        run: |
+          echo "::error::A refresh step failed (Telegram: ${{ steps.telegram.outcome }}, Amazon: ${{ steps.fetch.outcome }}). The site was still published with the data that is valid. Open the failed step above for the reason."
+          exit 1
